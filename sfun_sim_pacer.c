@@ -2,7 +2,7 @@
  *  Slow down a simulation to run at approximately real-time (or a chosen
  *  ratio of real-time).
  */
-#define S_FUNCTION_NAME sim_pacer
+#define S_FUNCTION_NAME sfun_sim_pacer
 #define S_FUNCTION_LEVEL 2
 
 #include "simstruc.h"
