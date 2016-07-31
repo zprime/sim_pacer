@@ -10,11 +10,18 @@
 #ifdef _WIN32
 /* On Windows we are using multimedia and performance timers/counters */
 #include <windows.h>
-#define clock_t int64_t
+    #define get_clock(x) QueryPerformanceCounter( &x );
+#elif __APPLE__
+    /* Apple, use mach_time for accurate and precise time */
+    #include <CoreServices/CoreServices.h>
+    #include <mach/mach.h>
+    #include <mach/mach_time.h>
+    #include <unistd.h>
+    #define get_clock(x) x = mach_absolute_time()
 #else
-/* Everything else can use time and usleep */
-#include <time.h>
-#include <unistd.h>
+    /* Everything else can use clock_gettime and usleep */
+    #include <time.h>
+    #define get_clock(x) clock_gettime( CLOCK_MONOTONIC, &ts ); x = ((int64_t)(ts->tv_sec))*1e9 + (int64_t)(ts->tv_nsec)
 #endif
 
 #ifdef MATLAB_MEX_FILE
@@ -31,7 +38,7 @@ enum { NUM_I_WORKS };
 enum { PW_CLOCK_LAST = 0, NUM_P_WORKS };
 
 /* R (real) work storage */
-enum { RW_T_FRAC = 0, RW_SIMT_LAST, RW_ACCUMERR, RW_TIMER_RES, NUM_R_WORKS };
+enum { RW_T_FRAC = 0, RW_SIMT_LAST, RW_ACCUMERR, RW_TIMER_RES, RW_FREQ, NUM_R_WORKS };
 
 /* S-function parameters*/
 enum { SP_T_FRAC = 0, SP_ENABLE_OUT, NUM_S_PARAMS };
@@ -129,17 +136,17 @@ static void mdlStart( SimStruct *S ) {
 #ifdef _WIN32
     TIMECAPS tc;
     int_T wTimerRes;
+#else
+    struct timespec ts;
 #endif
-    real_T timerRes;
+    real_T timerRes, r_freq;
     
     /* Allocate storage, and store the current time */
-    clock_t *startTime = malloc( sizeof( clock_t ) );
-#ifdef _WIN32
-    QueryPerformanceCounter( startTime );
-#else
-    *startTime = clock();
-#endif
-    ssSetPWorkValue( S, PW_CLOCK_LAST, (void *)startTime );
+    int64_t *storage = malloc( sizeof( int64_t ) );
+    int64_t startTime;
+    get_clock( startTime );
+    *storage = startTime;
+    ssSetPWorkValue( S, PW_CLOCK_LAST, (void *)storage );
     
     /* Store the relative time parameter, zero error, and last time */
     ssSetRWorkValue( S, RW_T_FRAC, mxGetScalar( PARAM_T_FRAC ) );
@@ -159,6 +166,20 @@ static void mdlStart( SimStruct *S ) {
     timerRes = 1e-6;
 #endif
     ssSetRWorkValue( S, RW_TIMER_RES, timerRes );
+    
+    /* Get and store the base frequency for the clock */
+#ifdef _WIN32
+    uint64_t t_freq;
+    QueryPerformanceFrequency( &t_freq );
+    r_freq = (real_T)t_freq;
+#elif __APPLE__
+    mach_timebase_info_data_t    sTimebaseInfo;
+    mach_timebase_info(&sTimebaseInfo);
+    r_freq = 1e9*((real_T) sTimebaseInfo.denom) / ((real_T)sTimebaseInfo.numer);
+#else
+    r_freq = (real_T) CLOCKS_PER_SEC;
+#endif
+    ssSetRWorkValue( S, RW_FREQ, r_freq );
 }
 
 /*
@@ -166,58 +187,55 @@ static void mdlStart( SimStruct *S ) {
  * the last small amounts.
  */
 static void mdlOutputs( SimStruct *S, int_T tid ) {
-    /* Real time values */
-    int64_t *t_last = (int64_t *)ssGetPWorkValue( S, PW_CLOCK_LAST );
-    int64_t t_now, t_target;
 #ifdef _WIN32
-    clock_t CLOCKS_PER_SEC;
-    QueryPerformanceFrequency( &CLOCKS_PER_SEC );
+#elif __APPLE__
+#else
+    struct timespec ts;
 #endif
     
+    /* Real time values */
+    int64_t *t_last = (int64_t *)ssGetPWorkValue( S, PW_CLOCK_LAST );
+    int64_t t_now, t_target, elapsed;
+    real_T r_freq = ssGetRWorkValue( S, RW_FREQ );
+    
     /* Sim-time values */
-    time_T s_last = (time_T) ssGetRWorkValue( S, RW_SIMT_LAST );
+    time_T s_last = ssGetRWorkValue( S, RW_SIMT_LAST );
     time_T s_now = ssGetT( S );
-    time_T s_elapsed = ( s_now - s_last ) / (time_T)ssGetRWorkValue( S, RW_T_FRAC );
+    time_T s_elapsed = ( s_now - s_last ) / ssGetRWorkValue( S, RW_T_FRAC );
     time_T delay, error, timeeps;
     
     /* Calculate the target clock value */
-    t_target = *t_last + (clock_t)( s_elapsed * CLOCKS_PER_SEC );
+    t_target = *t_last + (uint64_t)( s_elapsed * r_freq );
     
     /* Feedback value to correct for non-zero mean in task execution times */
-    timeeps = -0.5*ssGetRWorkValue( S, RW_ACCUMERR );
+    timeeps = -0.1*ssGetRWorkValue( S, RW_ACCUMERR );
     
     /* Sleep first so we aren't hogging to CPU */
     time_T t_res = ((time_T)ssGetRWorkValue( S, RW_TIMER_RES ));
-    
-#ifdef _WIN32
-    /* On windows, use Sleep with multimedia timers (configured in mdlStart) */
-    QueryPerformanceCounter( &t_now );
-    delay = ((time_T)( t_target - t_now ))/CLOCKS_PER_SEC - timeeps;
+    get_clock( t_now );
+    elapsed = t_target - t_now;
+    delay = ((time_T)( elapsed ))/r_freq - timeeps;
     if ( delay > 2*t_res ) {
+#ifdef _WIN32
+        /* On windows, use Sleep with multimedia timers (configured in mdlStart) */
         Sleep( (unsigned int) (( delay - t_res )*1000) );
-    }
 #else
     /* Other systems, use usleep */
-    t_now = clock();
-    delay = ((time_T)( t_target - t_now ))/CLOCKS_PER_SEC - timeeps;
-    if ( delay > 2*t_res ) {
         usleep( (unsigned int) (( delay - t_res )*1e6 ) ); 
-    }
 #endif
+    }
     
     /* Busy-wait for times smaller than the timer resolution */
     do {
-#ifdef _WIN32
-        QueryPerformanceCounter( &t_now );
-#else
-        t_now = clock();
-#endif
-        delay = ((time_T)( t_target - t_now ))/CLOCKS_PER_SEC;        
+        get_clock( t_now );
+        elapsed = t_target - t_now;
+        delay = ((real_T)(elapsed))/r_freq;     
     } while ( delay > timeeps );
-    
+     
     /* Update outputs, and save the previous values. Error is in real-time seconds */
-    error = (real_T)( s_elapsed - ((time_T)( t_now - *t_last ) / CLOCKS_PER_SEC ) );
-    ssSetRWorkValue( S, RW_ACCUMERR, ssGetRWorkValue( S, RW_ACCUMERR ) + error*(s_now-s_last)  );
+    elapsed = t_now - *t_last;
+    error = (real_T)( s_elapsed - ((time_T)( elapsed )) / r_freq );
+    ssSetRWorkValue( S, RW_ACCUMERR, ssGetRWorkValue( S, RW_ACCUMERR ) + error  );
     if ( ssGetNumOutputPorts(S)>0 ) {
         *ssGetOutputPortRealSignal( S, OP_TERR ) = error;
     }
@@ -228,16 +246,12 @@ static void mdlOutputs( SimStruct *S, int_T tid ) {
 /*
  * Store values when pausing/resuming the simulation
  */
-#if defined(MATLAB_MEX_FILE) 
+#ifdef MATLAB_MEX_FILE
 #define MDL_SIM_STATUS_CHANGE
 static void mdlSimStatusChange( SimStruct *S, ssSimStatusChangeType simStatus ) { 
-    clock_t *last = (clock_t *) ssGetPWorkValue( S, PW_CLOCK_LAST );
-    clock_t now;
-#ifdef _WIN32
-    QueryPerformanceCounter( &now );
-#else
-    now = clock();
-#endif
+    uint64_t *last = (uint64_t *) ssGetPWorkValue( S, PW_CLOCK_LAST );
+    uint64_t now;
+    get_clock( now );
     switch( simStatus ) {
         case SIM_PAUSE:
             /* Store current elapsed time in the clock time. */
